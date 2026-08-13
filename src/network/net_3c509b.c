@@ -32,6 +32,9 @@
 #include <86box/network.h>
 #include <86box/plat_unused.h>
 
+#define MAX_3C509B_CARDS    4
+#define EEPROM_SIZE_3C509B  128
+
 enum {
     ID_WAIT  = 0,
     ID_CMD   = 1,
@@ -39,13 +42,28 @@ enum {
 };
 
 typedef struct threec509b_t {
-    int         state;
+    int             state;
 
-    int         waitcmd_id_port;
-    int         is_seq_validated;
-    int         current_seq_byte;
-    int         confirmed_seq_bytes;
+    int             card_id;
+
+    int             waitcmd_id_port;
+    bool            is_seq_validated;
+    int             current_seq_byte;
+    int             confirmed_seq_bytes;
+
+    uint8_t         tag;
+
+    uint8_t         eeprom[EEPROM_SIZE_3C509B];
+    char            nvr_fn[64];
 } threec509b_t;
+
+typedef struct threec509b_bus_t {
+    threec509b_t    *cards[MAX_3C509B_CARDS];
+    int             card_count;
+    bool            handlers_registered;
+} threec509b_bus_t;
+
+static threec509b_bus_t g_3c509b_bus = {0};
 
 /*
  * threec509b_log
@@ -108,65 +126,116 @@ threec509b_nic_idwait_handler(uint16_t addr, uint8_t val, threec509b_t* dev)
     if (addr != dev->waitcmd_id_port)
         return;
 
-    threec509b_log("3C509B: sequence: was given %X (expected %X)\n", val, dev->current_seq_byte);
+    // threec509b_log("3C509B: sequence: was given %X (expected %X)\n", val, dev->current_seq_byte);
 
     if (val == dev->current_seq_byte) {
         dev->confirmed_seq_bytes++;
         if (dev->confirmed_seq_bytes >= 255) {
-            threec509b_log("3C509B: sequence validated, entering ID_CMD");
+            threec509b_log("3C509B: sequence validated, entering ID_CMD\n");
             dev->is_seq_validated = true;
             dev->state = ID_CMD;
             return;
         }
         dev->current_seq_byte = threec509b_id_seq_byte(dev->confirmed_seq_bytes);
-        threec509b_log("3C509B: sequence: next value should be %X\n", dev->current_seq_byte);
+        // threec509b_log("3C509B: sequence: next value should be %X\n", dev->current_seq_byte);
         return;
     }
 
     dev->current_seq_byte = 0xFF;
     dev->confirmed_seq_bytes = 0;
-    threec509b_log("3C509B: sequence: wrong value. resetting sequence. next value should be FF\n");
+    // threec509b_log("3C509B: sequence: wrong value. resetting sequence. next value should be FF\n");
 }
 
-// BUG: I valori del controller IDE a 1F0h e 170h vengono sovrascritti.
 static void
 threec509b_nic_idcmd_write(uint16_t addr, uint8_t val, threec509b_t* dev)
 {
     if (addr != dev->waitcmd_id_port)
         return;
 
-    switch (val) {
-        case 0x00 ... 0x7f:
-            break;
-        default:
-            break;
+    if (val <= 0x7f) {
+        /* 00 to 7F: Go to ID_WAIT state. Wait for next ID sequence. */
+        threec509b_log("3C509B: received cmd %X, returning to ID_WAIT\n", val);
+        dev->state = ID_WAIT;
+        return;
+    } else if (val <= 0xbf) {
+        threec509b_log("3C509B: received cmd %X, loading EEPROM word %X\n", val, val & 0x3F);
+        return;
+    } else if (val <= 0xcf) {
+        threec509b_log("3C509B: received cmd %X, global reset\n", val);
+        return;
+    } else if (val <= 0xd7) {
+        threec509b_log("3C509B: received cmd %X, setting tag adapter to %X\n", val, val & 0x7);
+        uint8_t n = val & 0x07;
+        if (n == 0) {
+            dev->tag = 0;
+            return;
+        }
+        if (dev->tag)
+            return;
+        dev->tag = n;
+        return;
+    } else if (val <= 0xdf) {
+        threec509b_log("3C509B: received cmd %X, testing adapter %X\n", val, val & 0x7);
+        uint8_t n = val & 0x7;
+        if (dev->tag != n)
+            dev->state = ID_WAIT;
+        return;
+    } else if (val <= 0xfe) {
+        threec509b_log("3C509B: received cmd %X, activating at IO base address: %X\n", val, val & 0x1F);
+        return;
+    } else if (val == 0xff) {
+        threec509b_log("3C509B: received cmd %X, activating at EEPROM IO base address\n", val);
+        return;
     }
+    threec509b_log("3C509B: received cmd %X, unknown\n", val);
+    /* TODO: 80-BF (EEPROM read), C0-CF (global reset), D0-DF (tag/test), E0-FF (activate). */
 }
 
 static uint8_t
-threec509b_nic_waitcmd_read(uint16_t addr, void *priv)
+threec509b_bus_read(uint16_t addr, void *priv)
 {
-    threec509b_t* dev = (threec509b_t *) priv;
+    threec509b_bus_t *bus = (threec509b_bus_t *) priv;
+    uint8_t bus_value = 0xFF;
 
-    // threec509b_log("3C509B: IN called! addr: 0x%X\n", addr);
+    for (int i = 0; i < bus->card_count; i++) {
+        threec509b_t *dev = bus->cards[i];
+        if (dev->state != ID_CMD || addr != dev->waitcmd_id_port)
+            continue;
+        bus_value &= ((dev->eeprom_data >> 15) & 1) ? 0x01 : 0x00;
+    }
 
-    return 0xFF;
+    for (int i = 0; i < bus->card_count; i++) {
+        threec509b_t *dev = bus->cards[i];
+        if (dev->state != ID_CMD || addr != dev->waitcmd_id_port)
+            continue;
+        int driven = (dev->eeprom_data >> 15) & 1;
+        dev->eeprom_data <<= 1;
+        if (driven && !(bus_value & 1))
+            dev->state = ID_WAIT;
+    }
+
+    return bus_value;
 }
 
 static void
-threec509b_nic_waitcmd_write(uint16_t addr, uint8_t val, void *priv)
+threec509b_bus_write(uint16_t addr, uint8_t val, void *priv)
 {
-    threec509b_t* dev = (threec509b_t *) priv;
-
     // threec509b_log("3C509B: OUT called! addr: 0x%X, val: 0x%X\n", addr, val);
+    threec509b_bus_t *bus = (threec509b_bus_t *) priv;
 
-    switch (dev->state) {
-        case ID_WAIT:
-            threec509b_nic_idwait_handler(addr, val, dev);
-        case ID_CMD:
-            threec509b_nic_idcmd_write(addr, val, dev);
-        default:
-            return;
+    for (int i = 0; i < bus->card_count; i++) {
+        threec509b_t *dev = bus->cards[i];
+
+        switch (dev->state) {
+            case ID_WAIT:
+                threec509b_nic_idwait_handler(addr, val, dev);
+                break;
+            case ID_CMD:
+                threec509b_nic_idcmd_write(addr, val, dev);
+                break;
+            default:
+                return;
+        }
     }
 }
 
@@ -176,26 +245,53 @@ threec509b_nic_init(UNUSED(const device_t *info))
     threec509b_t *dev = calloc(1, sizeof(threec509b_t));
     threec509b_log("3C509B: init called!\n");
 
-    /* The 3C509B operates with an activation mechanism which consists of 3 phases.
-     * The first one sets the ID_WAIT state: the card is waiting for the driver to
-     * write to any 01x0h I/O port (where the x is any hex value) to lock that port
-     * for normal use later on.
-     *
-     * We're skipping the 1F0h port as, on most hardware configurations, it conflicts
-     * with the IDE controller, making the whole emulation much slower and barely usable
-     * in certain cases. ~99% of the time the driver just uses port 110h.
-     */
+    dev->card_id = g_3c509b_bus.card_count;
+    if (dev->card_id < MAX_3C509B_CARDS) {
+        g_3c509b_bus.cards[dev->card_id] = dev;
+        g_3c509b_bus.card_count++;
+    } else
+        threec509b_log("3C509B: too many cards, %d not added to the bus.\n", dev->card_id);
 
     dev->state = ID_WAIT;
     threec509b_log("3C509B: state set to wait.\n");
 
-    for (int port = 0x100; port <= 0x1E0; port += 0x10)
-        io_sethandler(port, 1,
-                      threec509b_nic_waitcmd_read, NULL, NULL,
-                      threec509b_nic_waitcmd_write, NULL, NULL, dev);
+    if (!g_3c509b_bus.handlers_registered) {
+        /* The 3C509B operates with an activation mechanism which consists of 3 phases.
+         * The first one sets the ID_WAIT state: the card is waiting for the driver to
+         * write to any 01x0h I/O port (where the x is any hex value) to lock that port
+         * for normal use later on.
+         *
+         * We're skipping the 1F0h port as, on most hardware configurations, it conflicts
+         * with the IDE controller, making the whole emulation much slower and barely usable
+         * in certain cases. ~99% of the time the driver just uses port 110h.
+         */
+
+        for (int port = 0x100; port <= 0x1E0; port += 0x10)
+            io_sethandler(port, 1,
+                          threec509b_bus_read, NULL, NULL,
+                          threec509b_bus_write, NULL, NULL, &g_3c509b_bus);
+        g_3c509b_bus.handlers_registered = true;
         threec509b_log("3C509B: registered the IO ports with the emu.\n");
+    }
 
     return dev;
+}
+
+static void
+threec509b_nic_close(void *priv)
+{
+    threec509b_t *dev = (threec509b_t *) priv;
+
+    for (int i = 0; i < g_3c509b_bus.card_count; i++) {
+        if (g_3c509b_bus.cards[i] == dev) {
+            g_3c509b_bus.cards[i] = g_3c509b_bus.cards[g_3c509b_bus.card_count - 1];
+            g_3c509b_bus.cards[g_3c509b_bus.card_count - 1] = NULL;
+            g_3c509b_bus.card_count--;
+            break;
+        }
+    }
+
+    free(dev);
 }
 
 const device_t threec509b_device = {
@@ -204,7 +300,7 @@ const device_t threec509b_device = {
     .flags              = DEVICE_ISA,
     .local              = 0,
     .init               = threec509b_nic_init,
-    .close              = NULL,
+    .close              = threec509b_nic_close,
     .reset              = NULL,
     .available          = NULL,
     .speed_changed      = NULL,
