@@ -60,7 +60,10 @@ typedef struct threec509b_t {
     uint16_t        status;
     uint8_t         tag;
 
-    int             window;
+    uint8_t         window;
+
+    uint16_t        interrupt_mask;
+    uint16_t        rz_mask;
 
     /* Window 0 registers */                        // <port offset>
     uint16_t        eeprom_data;                    // 0C
@@ -70,12 +73,19 @@ typedef struct threec509b_t {
     uint16_t        configuration_control;          // 04
     uint16_t        product_id;                     // 02
 
+    /* Window 1 registers */
+    /* RX */
+    uint16_t        rx_status;
+
     /* Window 3 registers */
     uint32_t        internal_configuration;         // 02
 
     /* EEPROM */
     uint16_t        eeprom[EEPROM_WORDS_3C509B];
     char            nvr_fn[64];
+    bool            eeprom_ewen;
+
+    pc_timer_t      reset_timer;
 } threec509b_t;
 
 typedef struct threec509b_bus_t {
@@ -203,11 +213,129 @@ threec509b_eeprom_read(threec509b_t *dev, uint8_t addr)
     return dev->eeprom[addr];
 }
 
+static void
+threec509b_eeprom_handler(threec509b_t *dev)
+{
+    uint8_t cmd = dev->eeprom_command & 0xFF;
+    uint8_t op = cmd >> 6;
+    uint8_t addr = cmd & 0x3F;
+
+    switch (op) {
+        case 0x00:
+            if ((addr >> 4) == 0x3) dev->eeprom_ewen = true;        // Erase/Write Enable
+            else if ((addr >> 4) == 0x00) dev->eeprom_ewen = false; // Erase/Write Disable
+            else if ((addr >> 4) == 0x02 && dev->eeprom_ewen)       // Erase All
+                for (int i = 0; i < EEPROM_WORDS_3C509B; i++) dev->eeprom[i] = 0xFFFF;
+            else if ((addr >> 4) == 0x01 && dev->eeprom_ewen)       // Write All
+                for (int i = 0; i < EEPROM_WORDS_3C509B; i++) dev->eeprom[i] &= dev->eeprom_data;
+            break;
+        case 0x01:                                                  // Write
+            if (dev->eeprom_ewen)
+                dev->eeprom[addr] &= dev->eeprom_data;
+            break;
+        case 0x02:                                                  // Read
+            dev->eeprom_data = dev->eeprom[addr];
+            break;
+        case 0x03:                                                  // Erase
+            if (dev->eeprom_ewen)
+                dev->eeprom[addr] = 0xFFFF;
+            break;
+    }
+}
+
+static void
+threec509b_nic_status_irq(threec509b_t* dev)
+{
+    int irq = (dev->resource_configuration >> 12) & 0xF;
+    int valid = (irq == 3 || irq == 5 || irq == 7 || irq == 9 ||
+                irq == 10 || irq == 11 || irq == 12 || irq == 15);
+
+    if (!valid)
+        return;
+
+    if (dev->status & dev->rz_mask & dev->interrupt_mask) {
+        dev->status |= 0x41;
+        picint(1 << irq);
+    } else {
+        dev->status &= ~0x41;
+        picintc(1<< irq);
+    }
+}
+
+static void
+threec509b_reset_timer_cb(void *priv)
+{
+    threec509b_t *dev = (threec509b_t *) priv;
+    dev->status &= ~0x1000;
+}
+
+static void
+threec509b_nic_isa_bootstrap(threec509b_t* dev)
+{
+    dev->address_configuration = dev->eeprom[0x08];
+    dev->resource_configuration = dev->eeprom[0x09];
+    dev->product_id = dev->eeprom[0x03];
+    dev->internal_configuration = ((uint32_t) dev->eeprom[0x13] << 16) | dev->eeprom[0x12];
+}
+
+static void
+threec509b_nic_command_handler(threec509b_t *dev, uint16_t val)
+{
+    uint8_t cmd = val >> 11;
+    uint16_t arg = val & 0x7FF;
+
+    switch (cmd) {
+        case 0x0:                                                   // Global Reset (16 clock)
+            threec509b_log("3C509B: Global Reset.\n");
+            dev->status |= 0x1000;
+            threec509b_nic_isa_bootstrap(dev);
+            dev->state = ID_WAIT;
+            dev->tag = 0;
+            dev->window = 0;
+            dev->activated = false;
+            dev->eeprom_ewen = false;
+            dev->current_seq_byte = 0xFF;
+            dev->confirmed_seq_bytes = 0;
+            dev->is_seq_validated = 0;
+            dev->interrupt_mask = 0;
+            dev->rz_mask = 0;
+            timer_set_delay_u64(&dev->reset_timer, 16);
+            return;
+        case 0x1:                                                   // Select Register Window
+            threec509b_log("3C509B: Moving to window %d\n", arg & 0x7);
+            dev->window = arg & 0x7;
+            return;
+        case 0xC:                                                   // Request Interrupt
+            threec509b_log("3C509B: Interrupt requested\n");
+            dev->status |= 0x40;
+            threec509b_nic_status_irq(dev);
+            return;
+        case 0xD:                                                   // Acknowledge Interrupt
+            threec509b_log("3C509B: Acknowledged interrupt\n");
+            dev->status &= ~(arg & 0xFF);
+            threec509b_nic_status_irq(dev);
+            return;
+        case 0xE:                                                   // Set Interrupt Mask
+            threec509b_log("3C509B: Set interrupt mask\n");
+            dev->interrupt_mask = arg & 0xFF;
+            threec509b_nic_status_irq(dev);
+            return;
+        case 0xF:                                                   // Set Read Zero Mask
+            threec509b_log("3C509B: Set RZ Mask\n");
+            dev->rz_mask = arg & 0xFF;
+            threec509b_nic_status_irq(dev);
+            return;
+        default:
+            threec509b_log("3C509B: Command not implemented: cmd: %X arg: %X\n", cmd, arg);
+            return;
+    }
+}
+
 static uint16_t
 threec509b_nic_read(threec509b_t *dev, uint8_t off)
 {
     if (off == 0x0E)
-        return dev->status;
+        return (dev->status & dev->rz_mask) | ((dev->window & 0x7) << 13);
 
     switch (dev->window) {
         case 0:
@@ -227,13 +355,18 @@ threec509b_nic_read(threec509b_t *dev, uint8_t off)
 static void
 threec509b_nic_write(threec509b_t *dev, uint16_t val, uint8_t off)
 {
+    if (off == 0x0E) {
+        threec509b_nic_command_handler(dev, val);
+        return;
+    }
+
     switch (dev->window) {
         case 0:
             switch (off) {
                 case 0x04: dev->configuration_control = val; break;
                 case 0x06: dev->address_configuration = val; break;
                 case 0x08: dev->resource_configuration = val; break;
-                case 0x0A: dev->eeprom_command = val; break;
+                case 0x0A: dev->eeprom_command = val; threec509b_eeprom_handler(dev); break;
                 case 0x0C: dev->eeprom_data = val; break;
             }
     }
@@ -453,15 +586,6 @@ threec509b_classic_bus_write(uint16_t addr, uint8_t val, void *priv)
     }
 }
 
-static void
-threec509b_nic_isa_bootstrap(threec509b_t* dev)
-{
-    dev->address_configuration = dev->eeprom[0x08];
-    dev->resource_configuration = dev->eeprom[0x09];
-    dev->product_id = dev->eeprom[0x03];
-    dev->internal_configuration = ((uint32_t) dev->eeprom[0x13] << 16) | dev->eeprom[0x12];
-}
-
 static void *
 threec509b_nic_init(UNUSED(const device_t *info))
 {
@@ -481,6 +605,8 @@ threec509b_nic_init(UNUSED(const device_t *info))
     threec509b_eeprom_load(dev);
 
     threec509b_nic_isa_bootstrap(dev);
+
+    timer_add(&dev->reset_timer, threec509b_reset_timer_cb, dev, 0);
 
     dev->state = ID_WAIT;
     threec509b_log("3C509B: state set to wait.\n");
@@ -528,6 +654,8 @@ threec509b_nic_close(void *priv)
     }
 
     threec509b_eeprom_save(dev);
+
+    timer_stop(&dev->reset_timer);
 
     free(dev);
 }
