@@ -35,6 +35,7 @@
 
 #define MAX_3C509B_CARDS    4
 #define EEPROM_WORDS_3C509B 64
+#define RX_QUEUE_MAX        8
 
 static int g_3c509b_next_id = 0;
 
@@ -44,9 +45,17 @@ enum {
     ACTIVE   = 2
 };
 
+typedef struct pkt {
+    uint16_t         status;
+    uint16_t        len;
+    uint8_t         data[1536];
+} pkt_t;
+
 typedef struct threec509b_t {
     int             state;
     bool            activated;
+    netcard_t       *netcard;
+    uint8_t         mac[6];
 
     int             card_id;
 
@@ -65,6 +74,18 @@ typedef struct threec509b_t {
     uint16_t        interrupt_mask;
     uint16_t        rz_mask;
 
+    pkt_t           pkt_queue[RX_QUEUE_MAX];
+    int             pkt_q_head;
+    int             pkt_q_tail;
+    int             pkt_q_count;
+    int             pkt_q_pos;
+    /* RX FIFO */
+    int             rx_fifo_size;
+    int             rx_free;
+    /* TX FIFO */
+    int             tx_fifo_size;
+    int             tx_free;
+
     /* Window 0 registers */                        // <port offset>
     uint16_t        eeprom_data;                    // 0C
     uint16_t        eeprom_command;                 // 0A
@@ -79,6 +100,9 @@ typedef struct threec509b_t {
 
     /* Window 3 registers */
     uint32_t        internal_configuration;         // 02
+
+    /* Window 4 registers */
+    uint16_t        media_type_and_status;
 
     /* EEPROM */
     uint16_t        eeprom[EEPROM_WORDS_3C509B];
@@ -202,6 +226,13 @@ threec509b_eeprom_load(threec509b_t *dev)
 
     size_t n = fread(dev->eeprom, sizeof(uint16_t), EEPROM_WORDS_3C509B, fp);
     fclose(fp);
+
+    dev->mac[0] = (dev->eeprom[0x00] >> 8) & 0xFF;
+    dev->mac[1] =  dev->eeprom[0x00]       & 0xFF;
+    dev->mac[2] = (dev->eeprom[0x01] >> 8) & 0xFF;
+    dev->mac[3] =  dev->eeprom[0x01]       & 0xFF;
+    dev->mac[4] = (dev->eeprom[0x02] >> 8) & 0xFF;
+    dev->mac[5] =  dev->eeprom[0x02]       & 0xFF;
 }
 
 static uint16_t
@@ -270,12 +301,33 @@ threec509b_reset_timer_cb(void *priv)
 }
 
 static void
+threec509b_fifo_init(threec509b_t *dev)
+{
+    uint32_t total = ((dev->internal_configuration & 0x7) == 0x2) ? 32768 : 8192;
+    uint32_t tx, rx;
+
+    switch ((dev->internal_configuration >> 16) & 0x3) {
+        case 0: tx = total * 3 / 8; rx = total * 5 / 8; break;
+        case 1: tx = total / 4;     rx = total * 3 / 4; break;
+        case 2: tx = total / 2;     rx = tx;            break;
+        default: tx = total * 3 / 8; rx = total * 5 / 8; break;
+    }
+
+    dev->tx_fifo_size = tx;
+    dev->rx_fifo_size = rx;
+    dev->tx_free = tx;
+    dev->rx_free = rx;
+}
+
+static void
 threec509b_nic_isa_bootstrap(threec509b_t* dev)
 {
     dev->address_configuration = dev->eeprom[0x08];
     dev->resource_configuration = dev->eeprom[0x09];
     dev->product_id = dev->eeprom[0x03];
     dev->internal_configuration = ((uint32_t) dev->eeprom[0x13] << 16) | dev->eeprom[0x12];
+
+    threec509b_fifo_init(dev);
 }
 
 static void
@@ -304,6 +356,18 @@ threec509b_nic_command_handler(threec509b_t *dev, uint16_t val)
         case 0x1:                                                   // Select Register Window
             threec509b_log("3C509B: Moving to window %d\n", arg & 0x7);
             dev->window = arg & 0x7;
+            return;
+        case 0x8:                                                   // RX Discard
+            if (dev->pkt_q_count) {
+                dev->rx_free += dev->pkt_queue[dev->pkt_q_tail].len;
+                dev->pkt_q_tail = (dev->pkt_q_tail + 1) % RX_QUEUE_MAX;
+                dev->pkt_q_count--;
+                dev->pkt_q_pos = 0;
+                if (!dev->pkt_q_count) {
+                    dev->status &= ~0x10;
+                    threec509b_nic_status_irq(dev);
+                }
+            }
             return;
         case 0xC:                                                   // Request Interrupt
             threec509b_log("3C509B: Interrupt requested\n");
@@ -347,6 +411,22 @@ threec509b_nic_read(threec509b_t *dev, uint8_t off)
                 case 0x08: return dev->resource_configuration;
                 case 0x0A: return (dev->eeprom_command & ~(0x7 << 8)) | ((dev->tag & 0x7) << 8);
                 case 0x0C: return dev->eeprom_data;
+            }
+        case 1:
+            switch (off) {
+                case 0x00:
+                    if (dev->pkt_q_count) {
+                        pkt_t *p = &dev->pkt_queue[dev->pkt_q_tail];
+                        uint16_t v = 0;
+                        if (dev->pkt_q_pos < p->len)
+                            v = p->data[dev->pkt_q_pos];
+                        if (dev->pkt_q_pos + 1 < p->len)
+                            v |= p->data[dev->pkt_q_pos + 1] << 8;
+                        dev->pkt_q_pos += 2;
+                        return v;
+                    }
+                    return 0;
+                case 0x08: return dev->pkt_q_count ? dev->pkt_queue[dev->pkt_q_tail].status : 0;
             }
         default: return 0xFFFF;
     }
@@ -586,6 +666,42 @@ threec509b_classic_bus_write(uint16_t addr, uint8_t val, void *priv)
     }
 }
 
+static int
+threec509b_set_link_state(void * priv, uint32_t link_state)
+{
+    threec509b_t *dev = priv;
+
+    if (!(link_state & NET_LINK_DOWN))
+        dev->media_type_and_status |= (1<<11);
+    else
+        dev->media_type_and_status &= ~(1<<11);
+
+    return 0;
+}
+
+static int
+threec509b_rx(void *priv, uint8_t *pkt, int len)
+{
+    threec509b_t *dev = priv;
+
+    if (len > dev->rx_free || dev->pkt_q_count >= RX_QUEUE_MAX) {
+        return 0;
+    }
+
+    pkt_t *slot = &dev->pkt_queue[dev->pkt_q_head];
+    memcpy(slot->data, pkt, len);
+    slot->len = len;
+    slot->status = len & 0x7FF;
+
+    dev->pkt_q_head = (dev->pkt_q_head + 1) % RX_QUEUE_MAX;
+    dev->pkt_q_count++;
+    dev->rx_free -= len;
+
+    dev->status |= 0x10;
+    threec509b_nic_status_irq(dev);
+    return 1;
+}
+
 static void *
 threec509b_nic_init(UNUSED(const device_t *info))
 {
@@ -635,6 +751,8 @@ threec509b_nic_init(UNUSED(const device_t *info))
             threec509b_log("3C509B: classic: registered the IO ports with the emu.\n");
         }
     }
+
+    dev->netcard = network_attach(dev, dev->mac, threec509b_rx, threec509b_set_link_state);
 
     return dev;
 }
